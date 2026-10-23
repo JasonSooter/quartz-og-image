@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import fs from "node:fs/promises";
 import type { Readable } from "node:stream";
@@ -342,6 +343,13 @@ async function loadSystemFont(bold: boolean): Promise<{ data: Buffer; name: stri
 }
 
 export type SocialImageOptions = {
+  /**
+   * Where rendered images are cached between builds, keyed by a hash of
+   * everything that affects the image. A note whose card would look the same
+   * reuses the cached file instead of being rendered again. `false` disables
+   * the cache. Default: `node_modules/.cache/og-images`.
+   */
+  cacheDir?: string | false;
   colorScheme: ThemeKey;
   height: number;
   width: number;
@@ -571,6 +579,7 @@ export const defaultImage: SocialImageOptions["imageStructure"] = ({
 };
 
 const defaultOptions: SocialImageOptions = {
+  cacheDir: path.join(process.cwd(), "node_modules", ".cache", "og-images"),
   colorScheme: "lightMode",
   width: 1200,
   height: 630,
@@ -581,31 +590,66 @@ const defaultOptions: SocialImageOptions = {
   readingTimeText: (minutes) => `${minutes} min read`,
 };
 
-async function generateSocialImage(
-  { cfg, description, fonts, title, fileData }: ImageOptions,
-  userOpts: SocialImageOptions,
-): Promise<Readable> {
-  const { width, height } = userOpts;
-  const iconPath = joinSegments(QUARTZ, "static", "icon.png");
-  let iconBase64: string | undefined = undefined;
+/** Bump when the rendering pipeline changes in a way the cache key can't see. */
+const CACHE_VERSION = "1";
 
+async function loadIcon(): Promise<string | undefined> {
+  const iconPath = joinSegments(QUARTZ, "static", "icon.png");
   try {
     const iconData = await fs.readFile(iconPath);
-    iconBase64 = `data:image/png;base64,${iconData.toString("base64")}`;
+    return `data:image/png;base64,${iconData.toString("base64")}`;
   } catch {
     console.warn(styleText("yellow", `Warning: Could not find icon at ${iconPath}`));
+    return undefined;
   }
+}
 
-  const imageComponent = userOpts.imageStructure({
-    cfg,
-    userOpts,
-    title,
-    description,
-    fonts,
-    fileData,
-    iconBase64,
-  });
+/**
+ * Serialize a JSX tree to a stable string: tag names, props (keys sorted) and
+ * children, with function components expanded. Two trees that serialize the
+ * same render the same image (given the same fonts and size).
+ */
+export function serializeTree(node: unknown): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return JSON.stringify(node);
+  if (Array.isArray(node)) return `[${node.map(serializeTree).join(",")}]`;
+  if (typeof node === "object" && "type" in node && "props" in node) {
+    const { type, props } = node as { type: unknown; props: Record<string, unknown> };
+    if (typeof type === "function") {
+      return serializeTree((type as (p: Record<string, unknown>) => unknown)(props ?? {}));
+    }
+    const { children, ...rest } = props ?? {};
+    const attrs = Object.keys(rest)
+      .sort()
+      .map((k) => `${k}=${JSON.stringify(rest[k])}`)
+      .join(";");
+    return `<${String(type)} ${attrs}>${serializeTree(children)}</>`;
+  }
+  return JSON.stringify(node);
+}
 
+/** Cache key: the image's tree, size, fonts and the cache version. */
+export function imageCacheKey(
+  tree: unknown,
+  width: number,
+  height: number,
+  fonts: SatoriOptions["fonts"],
+): string {
+  const hash = createHash("sha256");
+  hash.update(`v${CACHE_VERSION}|${width}x${height}|`);
+  for (const f of fonts) {
+    hash.update(`${f.name}:${f.weight ?? ""}:${f.style ?? ""}:${f.data.byteLength}|`);
+  }
+  hash.update(serializeTree(tree));
+  return hash.digest("hex").slice(0, 32);
+}
+
+async function renderSocialImage(
+  imageComponent: unknown,
+  fonts: SatoriOptions["fonts"],
+  userOpts: SocialImageOptions,
+): Promise<Buffer> {
+  const { width, height } = userOpts;
   const svg = await satori(imageComponent as Parameters<typeof satori>[0], {
     width,
     height,
@@ -619,15 +663,17 @@ async function generateSocialImage(
     },
   });
 
-  return sharp(Buffer.from(svg)).webp({ quality: 40 });
+  return sharp(Buffer.from(svg)).webp({ quality: 40 }).toBuffer();
 }
 
-async function processOgImage(
+function processOgImage(
   ctx: BuildCtx,
   fileData: QuartzPluginData,
   fonts: SatoriOptions["fonts"],
   fullOptions: SocialImageOptions,
-) {
+  iconBase64: string | undefined,
+  usedKeys?: Set<string>,
+): Promise<FilePath> {
   const cfg = ctx.cfg.configuration;
   const slug = fileData.slug!;
   const titleSuffix = cfg.pageTitleSuffix ?? "";
@@ -638,23 +684,54 @@ async function processOgImage(
     frontmatter?.description ??
     unescapeHTML(fileData.description?.trim() ?? fullOptions.defaultDescription ?? "");
 
-  const stream = await generateSocialImage(
-    {
-      title,
-      description,
-      fonts,
-      cfg,
-      fileData,
-    },
-    fullOptions,
-  );
-
-  return write({
-    ctx,
-    content: stream,
-    slug: `${slug}-og-image` as FullSlug,
-    ext: ".webp",
+  const imageComponent = fullOptions.imageStructure({
+    cfg,
+    userOpts: fullOptions,
+    title,
+    description,
+    fonts,
+    fileData,
+    iconBase64,
   });
+
+  // Computed synchronously, so the key is recorded before emit() can prune.
+  const cacheDir = fullOptions.cacheDir;
+  const key = cacheDir
+    ? imageCacheKey(imageComponent, fullOptions.width, fullOptions.height, fonts)
+    : undefined;
+  if (key) usedKeys?.add(key);
+
+  return (async () => {
+    const cachePath = cacheDir && key ? path.join(cacheDir, `${key}.webp`) : undefined;
+    let image: Buffer | undefined;
+    if (cachePath) {
+      image = await fs.readFile(cachePath).catch(() => undefined);
+    }
+    if (!image) {
+      image = await renderSocialImage(imageComponent, fonts, fullOptions);
+      if (cachePath && cacheDir) {
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(cachePath, image);
+      }
+    }
+
+    return write({
+      ctx,
+      content: image,
+      slug: `${slug}-og-image` as FullSlug,
+      ext: ".webp",
+    });
+  })();
+}
+
+/** Delete cached images no page used in this (full) build. */
+async function pruneCache(cacheDir: string, usedKeys: Set<string>) {
+  const entries = await fs.readdir(cacheDir).catch(() => [] as string[]);
+  await Promise.all(
+    entries
+      .filter((name) => name.endsWith(".webp") && !usedKeys.has(name.slice(0, -5)))
+      .map((name) => fs.rm(path.join(cacheDir, name), { force: true })),
+  );
 }
 
 export const CustomOgImagesEmitterName = "CustomOgImages";
@@ -686,11 +763,15 @@ export const CustomOgImages: QuartzEmitterPlugin<Partial<SocialImageOptions>> = 
         return;
       }
 
+      const iconBase64 = await loadIcon();
+      const usedKeys = new Set<string>();
       for (const [_tree, vfile] of content) {
         const data = vfile.data as QuartzPluginData;
         if (data.frontmatter?.socialImage !== undefined) continue;
-        yield processOgImage(ctx, data, fonts, fullOptions);
+        yield processOgImage(ctx, data, fonts, fullOptions, iconBase64, usedKeys);
       }
+      // Every key is recorded synchronously above, so in-flight renders are safe.
+      if (fullOptions.cacheDir) await pruneCache(fullOptions.cacheDir, usedKeys);
     },
     async *partialEmit(ctx, _content, _resources, changeEvents) {
       const cfg = ctx.cfg.configuration;
@@ -703,12 +784,13 @@ export const CustomOgImages: QuartzEmitterPlugin<Partial<SocialImageOptions>> = 
         return;
       }
 
+      const iconBase64 = await loadIcon();
       for (const changeEvent of changeEvents) {
         if (!changeEvent.file) continue;
         const data = changeEvent.file.data as QuartzPluginData;
         if (data.frontmatter?.socialImage !== undefined) continue;
         if (changeEvent.type === "add" || changeEvent.type === "change") {
-          yield processOgImage(ctx, data, fonts, fullOptions);
+          yield processOgImage(ctx, data, fonts, fullOptions, iconBase64);
         }
       }
     },
